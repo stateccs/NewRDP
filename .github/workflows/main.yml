@@ -1,4 +1,6 @@
-name: RDP on: workflow_dispatch:
+name: RDP
+on:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -6,93 +8,84 @@ permissions:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
-      # 1. Checkout (optional, only if you need repo files)
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # 2. Enable RDP + open port 3389 (minimal required changes)
       - name: Enable RDP & Open Firewall
         run: |
           # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           
-          # Disable NLA (required for many RDP clients from non-domain machines)
+          # Disable NLA (required for reliable connection)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           
-          # Allow RDP through Windows Firewall (clean previous rule if exists)
-          netsh advfirewall firewall delete rule name="GitHub-RDP" > $null 2>&1
+          # Remove old rule if exists
+          netsh advfirewall firewall delete rule name="GitHub-RDP" 2>$null
+          
+          # Open port 3389
           netsh advfirewall firewall add rule name="GitHub-RDP" dir=in action=allow protocol=TCP localport=3389
           
-          # Restart Terminal Services
-          Restart-Service -Name TermService -Force
+          Restart-Service TermService -Force
 
-      # 3. Create secure local admin user + mask password
-      - name: Create RDP User
+      - name: Create Admin RDP User + Mask Password
+        shell: pwsh
         run: |
-          $password = (-join ((33..126) | Get-Random -Count 28 | % {[char]$_}))
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $password = -join ((33..126) | Get-Random -Count 32 | % {[char]$_})
+          $secPass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          New-LocalUser -Name "runneradmin" -Password $securePass -FullName "GitHub Runner Admin" -Description "Temporary RDP user" -AccountNeverExpires -PasswordNeverExpires
+          New-LocalUser -Name "runneradmin" -Password $secPass -FullName "RDP Admin" -Description "Temp GitHub RDP" -AccountNeverExpires -PasswordNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "runneradmin"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin"
 
-          # Mask the password so it never appears in logs
+          # This hides the password from logs
           Write-Output "::add-mask::$password"
-          Write-Output "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-        shell: pwsh
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-      # 4. Install & start Tailscale (official action = faster + always up-to-date)
       - name: Start Tailscale
         uses: tailscale/github-action@v2
         with:
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
           version: latest
-          args: --operator=$env:USERNAME --hostname=gh-runner-${{ github.run_id }}
+          args: --operator=${{ runner.name }} --hostname=gh-runner-${{ github.run_id }}
 
-      # 5. Get Tailscale IP
       - name: Get Tailscale IP
-        id: tailscale
-        run: |
-          $ip = (tailscale ip --4 | Select-Object -First 1).Trim()
-          if (-not $ip) { exit 1 }
-          echo "ip=$ip" >> $env:GITHUB_OUTPUT
+        id: ts
         shell: pwsh
-
-      # 6. Test RDP port internally
-      - name: Test RDP Port
         run: |
-          $result = Test-NetConnection -ComputerName ${{ steps.tailscale.outputs.ip }} -Port 3389 -WarningAction SilentlyContinue
+          $ip = tailscale ip -4 | Select-Object -First 1 | ForEach-Object Trim
+          if (!$ip) { exit 1 }
+          echo "ip=$ip" >> $env:GITHUB_OUTPUT
+
+      - name: Test RDP Port
+        shell: pwsh
+        run: |
+          $result = Test-NetConnection -ComputerName ${{ steps.ts.outputs.ip }} -Port 3389 -WarningAction SilentlyContinue
           if (-not $result.TcpTestSucceeded) {
-            Write-Error "RDP port 3389 is not reachable"
+            Write-Error "Port 3389 is not open!"
             exit 1
           }
-          Write-Host "R0DP port 3389 is open and reachable via Tailscale"
 
-      # 7. Final output + keep-alive
-      - name: RDP Ready — Keep Alive
+      - name: RDP Ready - Keep Runner Alive
+        shell: pwsh
         run: |
           Write-Host @"
-          
-          ╔══════════════════════════════════════════════════════╗
-          ║                    RDP ACCESS INFO                   ║
-          ╠══════════════════════════════════════════════════════╣
-          ║  Tailscale IP  : ${{ steps.tailscale.outputs.ip }}:3389            ║
-          ║  Username      : runneradmin                         ║
-          ║  Password      : ${{ env.RDP_PASSWORD }}             ║
-          ║                                                      ║
-          ║  Connect using any RDP client over Tailscale         ║
-          ║  (You must be in the same tailnet)                  ║
-          ╚══════════════════════════════════════════════════════╝
-          
+
+          =================================================
+                     RDP SESSION READY
+          =================================================
+          Tailscale IP   : ${{ steps.ts.outputs.ip }}:3389
+          Username       : runneradmin
+          Password       : ${{ env.RDP_PASSWORD }}
+          -------------------------------------------------
+          Connect via Windows RDP, Remmina, or any client
+          (You must be in the same Tailscale network)
+          =================================================
+
           "@
 
-          # Keep runner alive for up to 6 hours (or until manually cancelled)
-          $minutes = 360
-          for ($i = 0; $i -lt $minutes; $i += 5) {
-            Write-Host "[$(Get-Date -Format HH:mm:ss)] RDP session still active — $((360-$i)/60) hours remaining (or cancel workflow)"
+          $totalMinutes = 355
+          for ($i = 0; $i -lt $totalMinutes; $i += 5) {
+            $remaining = ($totalMinutes - $i) / 60
+            Write-Host "[$(Get-Date -Format HH:mm:ss)] Session active - ~$([math]::Round($remaining, 1)) hours left (or cancel workflow)"
             Start-Sleep -Seconds 300
           }
-        shell: pwsh
